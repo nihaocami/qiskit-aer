@@ -39,7 +39,8 @@ const Operations::OpSet StateOpSet(
      Operations::OpType::qerror_loc, Operations::OpType::matrix,
      Operations::OpType::diagonal_matrix, Operations::OpType::save_unitary,
      Operations::OpType::save_state, Operations::OpType::set_unitary,
-     Operations::OpType::jump, Operations::OpType::mark},
+     Operations::OpType::jump, Operations::OpType::mark,
+     Operations::OpType::store},
     // Gates
     {
         "u1",   "u2",     "u3",      "u",      "U",     "CX",    "cx",   "cz",
@@ -139,7 +140,7 @@ public:
   auto copy_to_matrix();
 
   // Apply the global phase
-  void apply_global_phase();
+  void apply_global_phase() override;
 
 protected:
   //-----------------------------------------------------------------------

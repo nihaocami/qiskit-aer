@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from qiskit.primitives.base import BaseEstimatorV2
-from qiskit.primitives.containers import EstimatorPubLike, PrimitiveResult, PubResult
+from qiskit.primitives.containers import DataBin, EstimatorPubLike, PrimitiveResult, PubResult
 from qiskit.primitives.containers.estimator_pub import EstimatorPub
 from qiskit.primitives.primitive_job import PrimitiveJob
 from qiskit.quantum_info import Pauli
@@ -76,7 +76,10 @@ class EstimatorV2(BaseEstimatorV2):
     def from_backend(cls, backend, **options):
         """make new sampler that uses external backend"""
         estimator = cls(**options)
-        estimator._backend = AerSimulator.from_backend(backend)
+        if isinstance(backend, AerSimulator):
+            estimator._backend = backend
+        else:
+            estimator._backend = AerSimulator.from_backend(backend)
         return estimator
 
     @property
@@ -104,7 +107,7 @@ class EstimatorV2(BaseEstimatorV2):
                 )
 
     def _run(self, pubs: list[EstimatorPub]) -> PrimitiveResult[PubResult]:
-        return PrimitiveResult([self._run_pub(pub) for pub in pubs])
+        return PrimitiveResult([self._run_pub(pub) for pub in pubs], metadata={"version": 2})
 
     def _run_pub(self, pub: EstimatorPub) -> PubResult:
         circuit = pub.circuit.copy()
@@ -132,7 +135,6 @@ class EstimatorV2(BaseEstimatorV2):
         ).result()
 
         # calculate expectation values (evs) and standard errors (stds)
-        rng = np.random.default_rng(self.options.run_options.get("seed_simulator"))
         flat_indices = list(param_indices.ravel())
         evs = np.zeros_like(bc_param_ind, dtype=float)
         stds = np.full(bc_param_ind.shape, precision)
@@ -143,10 +145,15 @@ class EstimatorV2(BaseEstimatorV2):
                 expval = result.data(flat_index)[pauli]
                 evs[index] += expval * coeff
         if precision > 0:
-            evs = rng.normal(evs, precision)
-        data_bin_cls = self._make_data_bin(pub)
-        data_bin = data_bin_cls(evs=evs, stds=stds)
+            rng = np.random.default_rng(self.options.run_options.get("seed_simulator"))
+            if not np.all(np.isreal(evs)):
+                raise ValueError("Given operator is not Hermitian and noise cannot be added.")
+            evs = rng.normal(evs, precision, evs.shape)
         return PubResult(
-            data_bin,
-            metadata={"target_precision": precision, "simulator_metadata": result.metadata},
+            DataBin(evs=evs, stds=stds, shape=evs.shape),
+            metadata={
+                "target_precision": precision,
+                "circuit_metadata": pub.circuit.metadata,
+                "simulator_metadata": result.metadata,
+            },
         )

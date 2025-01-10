@@ -18,10 +18,12 @@ from ddt import ddt
 import numpy as np
 from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister, assemble
 from qiskit.circuit.gate import Gate
-from qiskit.circuit.library.standard_gates import HGate
+from qiskit.circuit.library.standard_gates import HGate, XGate, ZGate
+from qiskit.quantum_info import Statevector
 from test.terra.reference import ref_algorithms
 
 from test.terra.backends.simulator_test_case import SimulatorTestCase, supported_methods
+from qiskit_aer.backends import StatevectorSimulator
 
 
 @ddt
@@ -193,29 +195,6 @@ class TestVariousCircuit(SimulatorTestCase):
 
         deepcopy(job.result())
 
-    def test_run_qobj(self):
-        """Test qobj run"""
-
-        qubits = QuantumRegister(3)
-        clbits = ClassicalRegister(3)
-
-        circuit = QuantumCircuit(qubits, clbits)
-        circuit.h(qubits[0])
-        circuit.cx(qubits[0], qubits[1])
-        circuit.cx(qubits[0], qubits[2])
-
-        for q, c in zip(qubits, clbits):
-            circuit.measure(q, c)
-
-        backend = self.backend()
-
-        shots = 1000
-        with self.assertWarns(DeprecationWarning):
-            result = backend.run(assemble(circuit), shots=shots).result()
-
-        self.assertSuccess(result)
-        self.compare_counts(result, [circuit], [{"0x0": 500, "0x7": 500}], delta=0.05 * shots)
-
     def test_numpy_integer_shots(self):
         """Test implicit cast of shot option from np.int_ to int."""
 
@@ -282,3 +261,27 @@ class TestVariousCircuit(SimulatorTestCase):
             self.fail("do not reach here")
         except Exception as e:
             self.assertTrue('"params" is incorrect length' in repr(e))
+
+    def test_controlled_gates(self):
+        """Test gates with control qubits"""
+        backend = StatevectorSimulator()
+        num_qubits = 4
+        circuit = QuantumCircuit(num_qubits)
+        cccx = XGate().control(num_ctrl_qubits=3, label=None, ctrl_state="100")
+        circuit.x(2)
+        circuit.compose(cccx, range(num_qubits), inplace=True)
+        job = backend.run(circuit)
+        state = job.result().get_statevector()
+        ref_state = Statevector(circuit)
+        self.assertEqual(state, ref_state)
+
+        num_qubits = 3
+        circuit = QuantumCircuit(num_qubits)
+        cccz = ZGate().control(num_ctrl_qubits=2, label=None, ctrl_state="10")
+        circuit.x(1)
+        circuit.x(2)
+        circuit.compose(cccz, range(num_qubits), inplace=True)
+        job = backend.run(circuit)
+        state = job.result().get_statevector()
+        ref_state = Statevector(circuit)
+        self.assertEqual(state, ref_state)

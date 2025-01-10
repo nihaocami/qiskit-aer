@@ -18,6 +18,7 @@ import unittest
 from test.terra.common import QiskitAerTestCase
 
 import numpy as np
+from qiskit import transpile
 from qiskit.circuit import Parameter, QuantumCircuit
 from qiskit.circuit.library import RealAmplitudes
 from qiskit.primitives import StatevectorEstimator
@@ -26,13 +27,14 @@ from qiskit.primitives.containers.estimator_pub import EstimatorPub
 from qiskit.primitives.containers.observables_array import ObservablesArray
 from qiskit.quantum_info import SparsePauliOp
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from qiskit.providers.fake_provider import GenericBackendV2
 
 from qiskit_aer import AerSimulator
 from qiskit_aer.primitives import EstimatorV2
 
 
 class TestEstimatorV2(QiskitAerTestCase):
-    """Test Estimator"""
+    """Test Estimator V2"""
 
     def setUp(self):
         super().setUp()
@@ -84,6 +86,7 @@ class TestEstimatorV2(QiskitAerTestCase):
         job = estimator.run([(psi1, ham1, [theta1])])
         result = job.result()
         np.testing.assert_allclose(result[0].data.evs, [1.5555572817900956], rtol=self._rtol)
+        self.assertIn("simulator_metadata", result[0].metadata)
 
         # Objects can be passed instead of indices.
         # Note that passing objects has an overhead
@@ -93,12 +96,14 @@ class TestEstimatorV2(QiskitAerTestCase):
         ham1 = hamiltonian1.apply_layout(psi2.layout)
         result2 = estimator.run([(psi2, ham1, theta2)]).result()
         np.testing.assert_allclose(result2[0].data.evs, [2.97797666], rtol=self._rtol)
+        self.assertIn("simulator_metadata", result2[0].metadata)
 
         # calculate [ <psi1(theta1)|H2|psi1(theta1)>, <psi1(theta1)|H3|psi1(theta1)> ]
         ham2 = hamiltonian2.apply_layout(psi1.layout)
         ham3 = hamiltonian3.apply_layout(psi1.layout)
         result3 = estimator.run([(psi1, [ham2, ham3], theta1)]).result()
         np.testing.assert_allclose(result3[0].data.evs, [-0.551653, 0.07535239], rtol=self._rtol)
+        self.assertIn("simulator_metadata", result3[0].metadata)
 
         # calculate [ [<psi1(theta1)|H1|psi1(theta1)>,
         #              <psi1(theta3)|H3|psi1(theta3)>],
@@ -114,6 +119,8 @@ class TestEstimatorV2(QiskitAerTestCase):
         ).result()
         np.testing.assert_allclose(result4[0].data.evs, [1.55555728, -1.08766318], rtol=self._rtol)
         np.testing.assert_allclose(result4[1].data.evs, [0.17849238], rtol=self._rtol)
+        self.assertIn("simulator_metadata", result4[0].metadata)
+        self.assertIn("simulator_metadata", result4[1].metadata)
 
     def test_estimator_with_pub(self):
         """Test estimator with explicit EstimatorPubs."""
@@ -296,10 +303,9 @@ class TestEstimatorV2(QiskitAerTestCase):
             est.run([(qc, op, None, -1)]).result()
         with self.assertRaises(ValueError):
             est.run([(qc, op)], precision=-1).result()
-        # Comment out after Qiskit 1.0.3
-        # with self.subTest("missing []"):
-        #     with self.assertRaisesRegex(ValueError, "An invalid Estimator pub-like was given"):
-        #         _ = est.run((qc, op)).result()
+        with self.subTest("missing []"):
+            with self.assertRaisesRegex(ValueError, "An invalid Estimator pub-like was given"):
+                _ = est.run((qc, op)).result()
 
     def test_run_numpy_params(self):
         """Test for numpy array as parameter values"""
@@ -346,6 +352,125 @@ class TestEstimatorV2(QiskitAerTestCase):
         job = estimator.run([(psi1, hamiltonian1, [theta1])], precision=self._precision * 0.5)
         result = job.result()
         np.testing.assert_allclose(result[0].data.evs, [1.5555572817900956], rtol=self._rtol)
+
+    def test_diff_precision(self):
+        """Test for running different precisions at once"""
+        estimator = EstimatorV2(options=self._options)
+        pm = generate_preset_pass_manager(optimization_level=0, backend=self.backend)
+        psi1 = pm.run(self.psi[0])
+        hamiltonian1 = self.hamiltonian[0].apply_layout(psi1.layout)
+        theta1 = self.theta[0]
+        job = estimator.run(
+            [(psi1, hamiltonian1, [theta1]), (psi1, hamiltonian1, [theta1], self._precision * 0.8)]
+        )
+        result = job.result()
+        np.testing.assert_allclose(result[0].data.evs, [1.901141473854881], rtol=self._rtol)
+        np.testing.assert_allclose(result[1].data.evs, [1.901141473854881], rtol=self._rtol)
+
+    def test_iter_pub(self):
+        """test for an iterable of pubs"""
+        circuit = self.ansatz.assign_parameters([0, 1, 1, 2, 3, 5])
+        pm = generate_preset_pass_manager(optimization_level=0, backend=self.backend)
+        circuit = pm.run(circuit)
+        estimator = EstimatorV2(options=self._options)
+        observable = self.observable.apply_layout(circuit.layout)
+        result = estimator.run(iter([(circuit, observable), (circuit, observable)])).result()
+        np.testing.assert_allclose(result[0].data.evs, [-1.284366511861733], rtol=self._rtol)
+        np.testing.assert_allclose(result[1].data.evs, [-1.284366511861733], rtol=self._rtol)
+
+    def test_metadata(self):
+        """Test for metadata"""
+        qc = QuantumCircuit(2)
+        qc2 = QuantumCircuit(2)
+        qc2.metadata = {"a": 1}
+        estimator = EstimatorV2(options=self._options)
+        pm = generate_preset_pass_manager(optimization_level=0, backend=self.backend)
+        qc, qc2 = pm.run([qc, qc2])
+        op = SparsePauliOp("ZZ").apply_layout(qc.layout)
+        op2 = SparsePauliOp("ZZ").apply_layout(qc2.layout)
+        result = estimator.run([(qc, op), (qc2, op2)], precision=0.1).result()
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result.metadata, {"version": 2})
+
+        metadata = result[0].metadata
+        self.assertIsInstance(metadata["simulator_metadata"], dict)
+        del metadata["simulator_metadata"]
+        self.assertEqual(
+            metadata,
+            {"target_precision": 0.1, "circuit_metadata": qc.metadata},
+        )
+
+        metadata = result[1].metadata
+        self.assertIsInstance(metadata["simulator_metadata"], dict)
+        del metadata["simulator_metadata"]
+        self.assertEqual(
+            result[1].metadata,
+            {"target_precision": 0.1, "circuit_metadata": qc2.metadata},
+        )
+
+    def test_truncate(self):
+        """Test for truncation of save_expval"""
+        qc = QuantumCircuit(2, 2)
+        qc.h(0)
+        qc.cx(0, 1)
+        qc.append(RealAmplitudes(num_qubits=2, reps=2), [0, 1])
+        backend_2 = GenericBackendV2(num_qubits=2)
+        backend_5 = GenericBackendV2(num_qubits=5)
+
+        qc_2 = transpile(qc, backend_2, optimization_level=0)
+        qc_5 = transpile(qc, backend_5, optimization_level=0)
+
+        estimator_2 = EstimatorV2.from_backend(backend_2, options=self._options)
+        estimator_5 = EstimatorV2.from_backend(backend_5, options=self._options)
+
+        H1 = self.observable
+        H1_2 = H1.apply_layout(qc_2.layout)
+        H1_5 = H1.apply_layout(qc_5.layout)
+        theta1 = [0, 1, 1, 2, 3, 5]
+
+        result_2 = estimator_2.run(
+            [
+                (qc_2, [H1_2], [theta1]),
+            ],
+            precision=0.01,
+        ).result()
+        result_5 = estimator_5.run(
+            [
+                (qc_5, [H1_5], [theta1]),
+            ],
+            precision=0.01,
+        ).result()
+        self.assertAlmostEqual(
+            result_5[0].data["evs"][0], result_2[0].data["evs"][0], delta=self._rtol
+        )
+
+    def test_truncate_large_backends(self):
+        """Test truncation allows us to run few-qubit circuits on many-qubit backends"""
+        N = 12
+        qc = QuantumCircuit(N)
+
+        qc.x(range(N))
+        qc.h(range(N))
+
+        for kk in range(N // 2, 0, -1):
+            qc.ch(kk, kk - 1)
+        for kk in range(N // 2, N - 1):
+            qc.ch(kk, kk + 1)
+
+        op = SparsePauliOp("Z" * N)
+        backend_127 = GenericBackendV2(num_qubits=127)
+        pm = generate_preset_pass_manager(backend=backend_127, optimization_level=1)
+        isa_circuit = pm.run(qc)
+        mapped_observable = op.apply_layout(isa_circuit.layout)
+
+        ref_est = StatevectorEstimator()
+        ref_result = ref_est.run(pubs=[(qc, op)]).result()
+
+        est = EstimatorV2()
+        res = est.run(pubs=[(isa_circuit, mapped_observable)]).result()
+
+        self.assertAlmostEqual(ref_result[0].data.evs, res[0].data.evs)
 
 
 if __name__ == "__main__":

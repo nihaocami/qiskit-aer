@@ -46,6 +46,7 @@ public:
   uint_t num_qubits = 0;    // maximum number of qubits needed for ops
   uint_t num_memory = 0;    // maximum number of memory clbits needed for ops
   uint_t num_registers = 0; // maximum number of registers clbits needed for ops
+  uint_t num_original_qubits = 0; // number of qubits without ancilla qubits
 
   // Measurement params
   bool has_conditional = false; // True if any ops are conditional
@@ -136,22 +137,22 @@ public:
             const std::vector<complex_t> &params,
             const std::vector<std::string> &string_params,
             const int_t cond_regidx = -1,
-            const std::shared_ptr<Operations::CExpr> expr = nullptr,
-            const std::string label = "") {
+            const std::shared_ptr<Operations::CExpr> &expr = nullptr,
+            const std::string &label = "") {
     ops.push_back(Operations::make_gate(name, qubits, params, string_params,
                                         cond_regidx, expr, label));
     check_gate_params(ops.back());
   }
 
   void diagonal(const reg_t &qubits, const cvector_t &vec,
-                const int_t cond_regidx = -1, const std::string label = "") {
+                const int_t cond_regidx = -1, const std::string &label = "") {
     ops.push_back(Operations::make_diagonal(qubits, vec, cond_regidx, label));
   }
 
   void unitary(const reg_t &qubits, const cmatrix_t &mat,
                const int_t cond_regidx = -1,
-               const std::shared_ptr<Operations::CExpr> expr = nullptr,
-               const std::string label = "") {
+               const std::shared_ptr<Operations::CExpr> &expr = nullptr,
+               const std::string &label = "") {
     ops.push_back(
         Operations::make_unitary(qubits, mat, cond_regidx, expr, label));
   }
@@ -168,8 +169,8 @@ public:
 
   void multiplexer(const reg_t &qubits, const std::vector<cmatrix_t> &mats,
                    const int_t cond_regidx = -1,
-                   const std::shared_ptr<Operations::CExpr> expr = nullptr,
-                   std::string label = "") {
+                   const std::shared_ptr<Operations::CExpr> &expr = nullptr,
+                   const std::string &label = "") {
     ops.push_back(
         Operations::make_multiplexer(qubits, mats, cond_regidx, expr, label));
   }
@@ -182,7 +183,7 @@ public:
 
   void superop(const reg_t &qubits, const cmatrix_t &mat,
                const int_t cond_regidx = -1,
-               const std::shared_ptr<Operations::CExpr> expr = nullptr) {
+               const std::shared_ptr<Operations::CExpr> &expr = nullptr) {
     ops.push_back(Operations::make_superop(qubits, mat, cond_regidx, expr));
   }
 
@@ -202,19 +203,20 @@ public:
   }
 
   void save_expval(const reg_t &qubits, const std::string &name,
-                   const std::vector<std::string> pauli_strings,
-                   const std::vector<double> coeff_reals,
-                   const std::vector<double> coeff_imags,
+                   const std::vector<std::string> &pauli_strings,
+                   const std::vector<double> &coeff_reals,
+                   const std::vector<double> &coeff_imags,
                    const std::string &snapshot_type,
-                   const std::string label = "") {
+                   const std::string &label = "") {
     ops.push_back(Operations::make_save_expval(qubits, name, pauli_strings,
                                                coeff_reals, coeff_imags,
                                                snapshot_type, label));
   }
 
-  void set_qerror_loc(const reg_t &qubits, const std::string &label,
-                      const int_t conditional = -1,
-                      const std::shared_ptr<Operations::CExpr> expr = nullptr) {
+  void
+  set_qerror_loc(const reg_t &qubits, const std::string &label,
+                 const int_t conditional = -1,
+                 const std::shared_ptr<Operations::CExpr> &expr = nullptr) {
     ops.push_back(
         Operations::make_qerror_loc(qubits, label, conditional, expr));
   }
@@ -254,7 +256,7 @@ public:
 
   void jump(const reg_t &qubits, const std::vector<std::string> &params,
             const int_t cond_regidx = -1,
-            const std::shared_ptr<Operations::CExpr> expr = nullptr) {
+            const std::shared_ptr<Operations::CExpr> &expr = nullptr) {
     ops.push_back(Operations::make_jump(qubits, params, cond_regidx, expr));
   }
 
@@ -273,6 +275,11 @@ public:
 
   void reset(const reg_t &qubits, const int_t cond_regidx = -1) {
     ops.push_back(Operations::make_reset(qubits, cond_regidx));
+  }
+
+  void store(const reg_t &qubits, const reg_t &clbits,
+             const std::shared_ptr<Operations::CExpr> expr) {
+    ops.push_back(Operations::make_store(qubits, clbits, expr));
   }
 
 private:
@@ -350,7 +357,7 @@ Circuit::Circuit(const inputdata_t &circ, const json_t &qobj_config,
   // without conversion we could call `get_reversed_ops` on the inputdata
   // without first converting.
   std::vector<Op> converted_ops;
-  for (auto the_op : input_ops) {
+  for (const auto &the_op : input_ops) {
     converted_ops.emplace_back(Operations::input_to_op(the_op));
   }
   ops = std::move(converted_ops);
@@ -413,7 +420,21 @@ void Circuit::reset_metadata() {
 void Circuit::add_op_metadata(const Op &op) {
   has_conditional |= op.conditional;
   opset_.insert(op);
-  qubitset_.insert(op.qubits.begin(), op.qubits.end());
+  if (op.type == OpType::save_expval || op.type == OpType::save_expval_var) {
+    for (int_t j = 0; j < op.expval_params.size(); j++) {
+      const std::string &pauli = std::get<0>(op.expval_params[j]);
+      for (int_t i = 0; i < op.qubits.size(); i++) {
+        // add qubit with non-I operator
+        // we also add one qubit if the qubitset is empty to prevent edge cases
+        // with empty circuits
+        if (qubitset_.empty() || pauli[pauli.size() - 1 - i] != 'I') {
+          qubitset_.insert(op.qubits[i]);
+        }
+      }
+    }
+  } else {
+    qubitset_.insert(op.qubits.begin(), op.qubits.end());
+  }
   memoryset_.insert(op.memory.begin(), op.memory.end());
   registerset_.insert(op.registers.begin(), op.registers.end());
 
@@ -450,6 +471,12 @@ void Circuit::set_params(bool truncation) {
     const auto &op = ops[rpos];
     if (op.type == OpType::mark && last_ancestor_pos == 0)
       last_ancestor_pos = rpos;
+    if (op.type == OpType::store) {
+      // Conservertively OpType::store does not allow sampling
+      can_sample = false;
+      if (last_ancestor_pos == 0)
+        last_ancestor_pos = rpos;
+    }
     if (!truncation || check_result_ancestor(op, ancestor_qubits)) {
       add_op_metadata(op);
       ancestor[rpos] = true;
@@ -571,12 +598,25 @@ void Circuit::set_params(bool truncation) {
   }
   for (size_t pos = 0; pos < head_end; ++pos) {
     if (ops_to_remove && !ancestor[pos] && ops[pos].type != OpType::mark &&
-        ops[pos].type != OpType::jump) {
+        ops[pos].type != OpType::jump && ops[pos].type != OpType::store) {
       // Skip if not ancestor
       continue;
     }
     if (remapped_qubits) {
       remap_qubits(ops[pos]);
+    } else if (truncation && qubitmap_.size() < ops[pos].qubits.size()) {
+      // truncate save_expval here when remap is not needed
+      if (ops[pos].type == OpType::save_expval ||
+          ops[pos].type == OpType::save_expval_var) {
+        int_t nparams = ops[pos].expval_params.size();
+        for (int_t i = 0; i < nparams; i++) {
+          std::string &pauli = std::get<0>(ops[pos].expval_params[i]);
+          std::string new_pauli;
+          new_pauli.assign(pauli.end() - qubitmap_.size(), pauli.end());
+          pauli = new_pauli;
+        }
+        ops[pos].qubits.resize(qubitmap_.size());
+      }
     }
     if (pos != op_idx) {
       ops[op_idx] = std::move(ops[pos]);
@@ -599,7 +639,7 @@ void Circuit::set_params(bool truncation) {
     op_idx++;
   }
 
-  for (auto dest : dests) {
+  for (const auto &dest : dests) {
     if (marks.find(dest) == marks.end()) {
       std::stringstream msg;
       msg << "Invalid jump destination:\"" << dest << "\"." << std::endl;
@@ -641,11 +681,35 @@ void Circuit::set_params(bool truncation) {
 }
 
 void Circuit::remap_qubits(Op &op) const {
-  reg_t new_qubits;
-  for (auto &qubit : op.qubits) {
-    new_qubits.push_back(qubitmap_.at(qubit));
+  // truncate save_expval
+  if (op.type == OpType::save_expval || op.type == OpType::save_expval_var) {
+    // map each qubit to its location in the pauli strings
+    std::unordered_map<uint_t, uint_t> ops_pauli_qubit_map;
+    for (size_t i = 0; i < op.qubits.size(); ++i) {
+      ops_pauli_qubit_map[op.qubits[i]] = op.qubits.size() - 1 - i;
+    }
+    int_t nparams = op.expval_params.size();
+    for (int_t i = 0; i < nparams; i++) {
+      std::string &pauli = std::get<0>(op.expval_params[i]);
+      std::string new_pauli;
+      new_pauli.resize(qubitmap_.size());
+      for (auto q = qubitmap_.cbegin(); q != qubitmap_.cend(); q++) {
+        new_pauli[qubitmap_.size() - 1 - q->second] =
+            pauli[ops_pauli_qubit_map[q->first]];
+      }
+      pauli = new_pauli;
+    }
+    op.qubits.resize(qubitmap_.size());
+    for (int_t i = 0; i < qubitmap_.size(); i++) {
+      op.qubits[i] = i;
+    }
+  } else {
+    reg_t new_qubits;
+    for (auto &qubit : op.qubits) {
+      new_qubits.push_back(qubitmap_.at(qubit));
+    }
+    op.qubits = std::move(new_qubits);
   }
-  op.qubits = std::move(new_qubits);
 }
 
 bool Circuit::check_result_ancestor(
@@ -675,7 +739,8 @@ bool Circuit::check_result_ancestor(
   case OpType::save_clifford:
   case OpType::save_unitary:
   case OpType::save_mps:
-  case OpType::save_superop: {
+  case OpType::save_superop:
+  case OpType::store: {
     ancestor_qubits.insert(op.qubits.begin(), op.qubits.end());
     return true;
   }

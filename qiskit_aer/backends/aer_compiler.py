@@ -19,6 +19,7 @@ from copy import copy
 from typing import List
 from warnings import warn
 from concurrent.futures import Executor
+import uuid
 import numpy as np
 
 from qiskit.circuit import QuantumCircuit, Clbit, ClassicalRegister, ParameterExpression
@@ -27,6 +28,7 @@ from qiskit.circuit.classical.types import Bool, Uint
 from qiskit.circuit.library import Initialize
 from qiskit.providers.options import Options
 from qiskit.pulse import Schedule, ScheduleBlock
+from qiskit.circuit import Store
 from qiskit.circuit.controlflow import (
     WhileLoopOp,
     ForLoopOp,
@@ -39,8 +41,6 @@ from qiskit.circuit.controlflow import (
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import Decompose
 
-
-from qiskit.qobj import QobjExperimentHeader
 from qiskit_aer.aererror import AerError
 from qiskit_aer.noise import NoiseModel
 
@@ -60,8 +60,8 @@ from qiskit_aer.backends.controller_wrappers import (
     AerConfig,
 )
 
-from .backend_utils import circuit_optypes
-from ..library.control_flow_instructions import AerMark, AerJump
+from .backend_utils import circuit_optypes, CircuitHeader
+from ..library.control_flow_instructions import AerMark, AerJump, AerStore
 
 
 class AerCompiler:
@@ -100,7 +100,9 @@ class AerCompiler:
                 if self._is_dynamic(circuit, compiled_optypes[idx]):
                     pm = PassManager([Decompose(["mark", "jump"])])
                     compiled_circ = pm.run(self._inline_circuit(circuit, None, None))
-
+                    # compiled_circ._vars_local = inlined_circ._vars_local
+                    # compiled_circ._vars_input = inlined_circ._vars_input
+                    # compiled_circ._vars_capture = inlined_circ._vars_capture
                     compiled_circuits.append(compiled_circ)
                     # Recompute optype for compiled circuit
                     compiled_optypes[idx] = circuit_optypes(compiled_circ)
@@ -119,7 +121,8 @@ class AerCompiler:
         if isinstance(optype, set) and Initialize not in optype:
             return circ
 
-        for inst, _, _ in circ.data:
+        for datum in circ.data:
+            inst = datum.operation
             if isinstance(inst, Initialize) and (
                 (not isinstance(inst.params[0], complex)) or (len(inst.params) == 1)
             ):
@@ -129,7 +132,8 @@ class AerCompiler:
 
         new_circ = circ.copy()
         new_circ.data = []
-        for inst, qargs, cargs in circ.data:
+        for datum in circ.data:
+            inst, qargs, cargs = datum.operation, datum.qubits, datum.clbits
             if isinstance(inst, Initialize) and (
                 (not isinstance(inst.params[0], complex)) or (len(inst.params) == 1)
             ):
@@ -210,6 +214,12 @@ class AerCompiler:
                 ret._append(
                     AerJump(continue_label, ret.num_qubits, ret.num_clbits), ret.qubits, ret.clbits
                 )
+            elif isinstance(instruction.operation, Store):
+                ret._append(
+                    AerStore(ret.num_qubits, ret.num_clbits, instruction.operation),
+                    ret.qubits,
+                    ret.clbits,
+                )
             else:
                 ret._append(instruction)
         return ret
@@ -249,6 +259,9 @@ class AerCompiler:
         """inline for_loop body while iterating its indexset"""
         qargs = [bit_map[q] for q in instruction.qubits]
         cargs = [bit_map[c] for c in instruction.clbits]
+        # to avoid wrong topological sorting of command with "empty" block
+        if len(qargs) == 0:
+            qargs = parent.qubits
         indexset, loop_parameter, body = instruction.operation.params
         inner_bit_map = {
             inner: bit_map[outer]
@@ -269,9 +282,15 @@ class AerCompiler:
             inlined_body = self._inline_circuit(body, continue_label, break_label, inner_bit_map)
             if loop_parameter is not None:
                 inlined_body = inlined_body.assign_parameters({loop_parameter: index})
-            #            parent.append(inlined_body, qargs, cargs)
             for inst in inlined_body:
-                parent.append(inst, qargs, cargs)
+                parent.append(
+                    inst.replace(
+                        qubits=[inner_bit_map[bit] for bit in inst.qubits],
+                        clbits=[inner_bit_map[bit] for bit in inst.clbits],
+                    ),
+                    qargs,
+                    cargs,
+                )
             parent.append(AerMark(continue_label, len(qargs), len(cargs)), qargs, cargs)
 
         if inlined_body is not None:
@@ -289,20 +308,24 @@ class AerCompiler:
         continue_label = f"{loop_name}_continue"
         loop_start_label = f"{loop_name}_start"
         break_label = f"{loop_name}_end"
+        inline_bit_map = {
+            inner: bit_map[outer]
+            for inner, outer in itertools.chain(
+                zip(body.qubits, instruction.qubits),
+                zip(body.clbits, instruction.clbits),
+            )
+        }
         inlined_body = self._inline_circuit(
             body,
             continue_label,
             break_label,
-            {
-                inner: bit_map[outer]
-                for inner, outer in itertools.chain(
-                    zip(body.qubits, instruction.qubits),
-                    zip(body.clbits, instruction.clbits),
-                )
-            },
+            inline_bit_map,
         )
         qargs = [bit_map[q] for q in instruction.qubits]
         cargs = [bit_map[c] for c in instruction.clbits]
+        # to avoid wrong topological sorting of command with "empty" block
+        if len(qargs) == 0:
+            qargs = parent.qubits
 
         if isinstance(condition_tuple, Expr):
             mark_cargs = self._list_clbit_from_expr(bit_map, condition_tuple)
@@ -323,7 +346,14 @@ class AerCompiler:
         parent.append(AerJump(break_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
         parent.append(AerMark(loop_start_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
         for inst in inlined_body:
-            parent.append(inst, qargs, cargs)
+            parent.append(
+                inst.replace(
+                    qubits=[inline_bit_map[bit] for bit in inst.qubits],
+                    clbits=[inline_bit_map[bit] for bit in inst.clbits],
+                ),
+                qargs,
+                cargs,
+            )
         parent.append(AerJump(continue_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
         parent.append(AerMark(break_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
 
@@ -347,6 +377,13 @@ class AerCompiler:
 
         qargs = [bit_map[q] for q in instruction.qubits]
         cargs = [bit_map[c] for c in instruction.clbits]
+        # to avoid wrong topological sorting of command with "empty" block
+        if len(qargs) == 0:
+            qargs = parent.qubits
+
+        # to avoid wrong topological sorting of command with "empty" block
+        if len(qargs) == 0:
+            qargs = parent.qubits
 
         if isinstance(condition_tuple, Expr):
             mark_cargs = self._list_clbit_from_expr(bit_map, condition_tuple)
@@ -373,7 +410,14 @@ class AerCompiler:
         parent.append(AerMark(if_true_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
         child = self._inline_circuit(true_body, continue_label, break_label, true_bit_map)
         for inst in child.data:
-            parent.append(inst, qargs, cargs)
+            parent.append(
+                inst.replace(
+                    qubits=[true_bit_map[bit] for bit in inst.qubits],
+                    clbits=[true_bit_map[bit] for bit in inst.clbits],
+                ),
+                qargs,
+                cargs,
+            )
 
         if false_body:
             false_bit_map = {
@@ -387,7 +431,14 @@ class AerCompiler:
             parent.append(AerMark(if_else_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
             child = self._inline_circuit(false_body, continue_label, break_label, false_bit_map)
             for inst in child.data:
-                parent.append(inst, qargs, cargs)
+                parent.append(
+                    inst.replace(
+                        qubits=[false_bit_map[bit] for bit in inst.qubits],
+                        clbits=[false_bit_map[bit] for bit in inst.clbits],
+                    ),
+                    qargs,
+                    cargs,
+                )
 
         parent.append(AerMark(if_end_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
 
@@ -401,6 +452,9 @@ class AerCompiler:
 
         qargs = [bit_map[q] for q in instruction.qubits]
         cargs = [bit_map[c] for c in instruction.clbits]
+        # to avoid wrong topological sorting of command with "empty" block
+        if len(qargs) == 0:
+            qargs = parent.qubits
 
         if isinstance(instruction.operation.target, Clbit):
             target_clbits = {bit_map[instruction.operation.target]}
@@ -472,7 +526,14 @@ class AerCompiler:
                 case_data.body, continue_label, break_label, case_data.bit_map
             )
             for inst in child.data:
-                parent.append(inst, qargs, cargs)
+                parent.append(
+                    inst.replace(
+                        qubits=[case_data.bit_map[bit] for bit in inst.qubits],
+                        clbits=[case_data.bit_map[bit] for bit in inst.clbits],
+                    ),
+                    qargs,
+                    cargs,
+                )
             parent.append(AerJump(switch_end_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
 
         parent.append(AerMark(switch_end_label, len(qargs), len(mark_cargs)), qargs, mark_cargs)
@@ -612,7 +673,7 @@ def assemble_circuit(circuit: QuantumCircuit, basis_gates=None):
 
     num_qubits = circuit.num_qubits
     num_memory = circuit.num_clbits
-    max_conditional_idx = 0
+    extra_creg_idx = 0
 
     qreg_sizes = []
     creg_sizes = []
@@ -635,7 +696,7 @@ def assemble_circuit(circuit: QuantumCircuit, basis_gates=None):
         for inst in circuit.data
     )
 
-    header = QobjExperimentHeader(
+    header = CircuitHeader(
         n_qubits=num_qubits,
         qreg_sizes=qreg_sizes,
         memory_slots=num_memory,
@@ -652,6 +713,12 @@ def assemble_circuit(circuit: QuantumCircuit, basis_gates=None):
     aer_circ.num_qubits = num_qubits
     aer_circ.num_memory = num_memory
     aer_circ.global_phase_angle = global_phase
+
+    var_heap_map = {}
+    for var in _iter_var_recursive(circuit):
+        memory_pos = num_memory + extra_creg_idx
+        var_heap_map[var.name] = (memory_pos, var.type.width)
+        extra_creg_idx += var.type.width
 
     num_of_aer_ops = 0
     index_map = []
@@ -673,10 +740,10 @@ def assemble_circuit(circuit: QuantumCircuit, basis_gates=None):
                     if clbit in ctrl_reg:
                         mask |= 1 << idx
                         val |= ((ctrl_val >> list(ctrl_reg).index(clbit)) & 1) << idx
-            conditional_reg = num_memory + max_conditional_idx
+            conditional_reg = num_memory + extra_creg_idx
             aer_circ.bfunc(f"0x{mask:X}", f"0x{val:X}", "==", conditional_reg)
             num_of_aer_ops += 1
-            max_conditional_idx += 1
+            extra_creg_idx += 1
         elif hasattr(inst.operation, "condition_expr") and inst.operation.condition_expr:
             conditional_expr = inst.operation.condition_expr
 
@@ -705,11 +772,30 @@ def _assemble_type(expr_type):
         raise AerError(f"unknown type: {expr_type.__class__}")
 
 
+def _iter_var_recursive(circuit):
+    yield from circuit.iter_vars()
+    for instruction in circuit.data:
+        for param in instruction.operation.params:
+            if isinstance(param, QuantumCircuit):
+                yield from _iter_var_recursive(param)
+
+
+def _find_var_clbits(circuit, var_uuid):
+    clbit_index = circuit.num_clbits
+    for var in _iter_var_recursive(circuit):
+        if var.var == var_uuid:
+            return list(range(clbit_index, clbit_index + var.type.width))
+        clbit_index += var.type.width
+    raise AerError(f"Var is not registed in this circuit: uuid={var_uuid}")
+
+
 def _assemble_clbit_indices(circ, c):
     if isinstance(c, (ClassicalRegister, list)):
         return [circ.find_bit(cbit).index for cbit in c]
     elif isinstance(c, Clbit):
         return [circ.find_bit(c).index]
+    elif isinstance(c, uuid.UUID):
+        return _find_var_clbits(circ, c)
     else:
         raise AerError(f"unknown clibt list: {c.__class__}")
 
@@ -834,17 +920,17 @@ def _assemble_op(
         if ctrl_state_pos > 0:
             # Add x gates for ctrl qubits which state=0
             ctrl_state = int(name[ctrl_state_pos+2:len(name)])
-            for i in range(len(qubits)):
+            for i in range(len(qubits)-1):
                 if (ctrl_state >> i) & 1 == 0:
-                    qubits_i = [qubits[len(qubits) - 1 - i]]
+                    qubits_i = [qubits[i]]
                     aer_circ.gate("x", qubits_i, params, [], conditional_reg, aer_cond_expr,
                                   label if label else "x")
                     num_of_aer_ops += 1
             aer_circ.gate(gate_name, qubits, params, [], conditional_reg, aer_cond_expr,
                           label if label else gate_name)
-            for i in range(len(qubits)):
+            for i in range(len(qubits)-1):
                 if (ctrl_state >> i) & 1 == 0:
-                    qubits_i = [qubits[len(qubits) - 1 - i]]
+                    qubits_i = [qubits[i]]
                     aer_circ.gate("x", qubits_i, params, [], conditional_reg, aer_cond_expr,
                                   label if label else "x")
                     num_of_aer_ops += 1
@@ -946,7 +1032,18 @@ def _assemble_op(
         raise AerError(
             "control-flow instructions must be converted " f"to jump and mark instructions: {name}"
         )
-
+    elif name == "aer_store":
+        if not isinstance(operation.store.lvalue, Var):
+            raise AerError(f"unsupported lvalue : {operation.store.lvalue.__class__}")
+        aer_circ.store(qubits, _assemble_clbit_indices(circ, operation.store.lvalue.var),
+                       operation.store.rvalue.accept(_AssembleExprImpl(circ)))
+        num_of_aer_ops = 1
+    elif name == "store":
+        if not isinstance(operation.lvalue, Var):
+            raise AerError(f"unsupported lvalue : {operation.lvalue.__class__}")
+        aer_circ.store(qubits, _assemble_clbit_indices(circ, operation.lvalue.var),
+                       operation.rvalue.accept(_AssembleExprImpl(circ)))
+        num_of_aer_ops = 1
     else:
         raise AerError(f"unknown instruction: {name}")
 

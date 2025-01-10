@@ -45,7 +45,7 @@ const Operations::OpSet StateOpSet(
      OpType::set_densmat,  OpType::save_expval, OpType::save_expval_var,
      OpType::save_densmat, OpType::save_probs,  OpType::save_probs_ket,
      OpType::save_amps_sq, OpType::save_state,  OpType::jump,
-     OpType::mark},
+     OpType::mark,         OpType::store},
     // Gates
     {"U",   "CX", "u1",   "u2",  "u3",    "u",     "cx",  "cy",  "cz",  "swap",
      "id",  "x",  "y",    "z",   "h",     "s",     "sdg", "t",   "tdg", "ccx",
@@ -1003,7 +1003,7 @@ std::vector<SampleVector> State<densmat_t>::sample_measure(const reg_t &qubits,
   allbit_samples = BaseState::qreg_.sample_measure(rnds);
 
   // Convert to bit format
-  int_t npar = BaseState::threads_;
+  uint_t npar = BaseState::threads_;
   if (npar > shots)
     npar = shots;
   std::vector<SampleVector> all_samples(shots, SampleVector(qubits.size()));
